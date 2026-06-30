@@ -1,0 +1,275 @@
+{
+  "project": "MugizhNokku-Data-Pipeline",
+  "role": "Maxus — Data Pipeline Engineer",
+  "golden_rule": "I do not touch the UI. I do not touch the web server. My sole output is clean, forecasted tensors.",
+  "output_contract": {
+    "format": ".zarr",
+    "location": "../data/forecast_output.zarr",
+    "consumer": "SRI (Core Integrator)",
+    "schema": {
+      "dimensions": ["time", "latitude", "longitude"],
+      "variables": [
+        { "name": "rainfall",   "units": "mm/hr",  "range": [0, 150] },
+        { "name": "lst",        "units": "Kelvin",  "range": [270, 320] },
+        { "name": "wind_speed", "units": "km/hr",   "range": [0, 200] }
+      ],
+      "attributes": [
+        "created_at",
+        "forecast_base_time",
+        "model",
+        "variables",
+        "description"
+      ]
+    }
+  },
+
+  "pipeline_stages": [
+
+    {
+      "stage": 1,
+      "name": "Data Ingestion",
+      "file": "ingest.py",
+      "entry_point": "load_all(imd_path, mosdac_path)",
+      "returns": "xr.Dataset",
+      "sources": [
+        {
+          "id": "IMD_RAINFALL",
+          "name": "IMD Gridded Rainfall",
+          "portal": "https://imdpune.gov.in/",
+          "format": ".nc (NetCDF)",
+          "variable_raw": "RAINFALL / rf / rain / precipitation",
+          "variable_standardised": "rainfall",
+          "spatial_coverage": "India + Bay of Bengal",
+          "temporal_resolution": "hourly / daily",
+          "loader_function": "load_imd_rainfall(nc_path)"
+        },
+        {
+          "id": "MOSDAC_INSAT",
+          "name": "ISRO MOSDAC INSAT-3D/3DR",
+          "portal": "https://mosdac.gov.in/",
+          "format": ".h5 (HDF5)",
+          "variables_available": ["LST", "SST", "PRECIPITATION"],
+          "variable_used": "LST (Land Surface Temperature)",
+          "loader_function": "load_mosdac_insat(h5_path, variable='LST')",
+          "hdf5_keys": {
+            "data":     "LST or PRECIPITATION",
+            "latitude": "Latitude",
+            "longitude":"Longitude",
+            "time_attr": "Image_Date_Time"
+          }
+        },
+        {
+          "id": "SYNTHETIC_FALLBACK",
+          "name": "Synthetic Cyclone Data (Dev/Demo)",
+          "description": "Auto-generated when real files unavailable. Simulates a cyclone eye moving NW over the Bay of Bengal.",
+          "function": "generate_synthetic_data(n_hours=24)",
+          "seed": 42
+        }
+      ],
+      "region_of_interest": {
+        "lat_min": 5.0,
+        "lat_max": 25.0,
+        "lon_min": 80.0,
+        "lon_max": 100.0,
+        "description": "Bay of Bengal — cyclone activity zone"
+      }
+    },
+
+    {
+      "stage": 2,
+      "name": "Preprocessing",
+      "file": "preprocess.py",
+      "entry_point": "run(ds)",
+      "returns": ["X: torch.Tensor [N, T_in, C, H, W]", "Y: torch.Tensor [N, T_out, C, H, W]", "vars_used: list"],
+      "steps": [
+        {
+          "step": "2a",
+          "name": "Regrid",
+          "function": "regrid(ds)",
+          "method": "xarray linear interpolation",
+          "target_resolution_deg": 0.25,
+          "note": "Aligns IMD and INSAT onto identical lat/lon grid"
+        },
+        {
+          "step": "2b",
+          "name": "Fill Missing Values",
+          "function": "fill_missing(ds)",
+          "strategy": ["temporal forward-fill", "temporal backward-fill", "variable median fallback"]
+        },
+        {
+          "step": "2c",
+          "name": "Normalise",
+          "function": "normalise(ds)",
+          "method": "min-max → [0, 1]",
+          "bounds": {
+            "rainfall":   [0.0,   150.0],
+            "lst":        [270.0, 320.0],
+            "wind_speed": [0.0,   200.0]
+          },
+          "inverse_function": "denormalise(tensor, var_order)"
+        },
+        {
+          "step": "2d",
+          "name": "Build Sliding Windows",
+          "function": "build_sequences(ds)",
+          "input_steps": 6,
+          "output_steps": 1,
+          "X_shape": "[N, 6, C, H, W]",
+          "Y_shape": "[N, 1, C, H, W]"
+        }
+      ]
+    },
+
+    {
+      "stage": 3,
+      "name": "AI/ML Model — ConvLSTM",
+      "file": "model.py",
+      "framework": "PyTorch",
+      "architecture": "Encoder-Decoder ConvLSTM",
+      "entry_class": "CycloneForecaster",
+      "reference": "https://github.com/ndrplz/ConvLSTM_pytorch",
+
+      "components": [
+        {
+          "name": "ConvLSTMCell",
+          "description": "Single time-step ConvLSTM cell. Replaces LSTM matrix multiply with 2D convolutions.",
+          "gates": ["input (i)", "forget (f)", "output (o)", "candidate cell (g)"],
+          "gate_formula": {
+            "i": "sigmoid(Conv([x, h]))",
+            "f": "sigmoid(Conv([x, h]))",
+            "o": "sigmoid(Conv([x, h]))",
+            "g": "tanh(Conv([x, h]))",
+            "c_next": "f * c + i * g",
+            "h_next": "o * tanh(c_next)"
+          },
+          "init_hidden": "zeros(B, hidden_channels, H, W)"
+        },
+        {
+          "name": "ConvLSTM",
+          "description": "Multi-layer stacked ConvLSTM. Processes full T-step sequence.",
+          "input_shape":  "[B, T, C, H, W]",
+          "output_shape": "[B, T, hidden_last, H, W]"
+        },
+        {
+          "name": "CycloneForecaster",
+          "description": "Full encoder-decoder. Encoder reads past maps; decoder autoregressively generates future maps.",
+          "sub_modules": {
+            "encoder": "ConvLSTM — processes observed T_in frames",
+            "bridge":  "Conv2d — projects last encoder hidden state to decoder input frame",
+            "decoder": "ConvLSTM — autoregressively generates T_out frames",
+            "head":    "Conv2d(hidden→C) + Sigmoid — maps hidden dim back to output channels"
+          },
+          "input_shape":  "[B, T_in,  C, H, W]",
+          "output_shape": "[B, T_out, C, H, W]",
+          "teacher_forcing": "Enabled during training (ratio=0.5)"
+        }
+      ],
+
+      "default_hyperparameters": {
+        "in_channels":   3,
+        "out_channels":  3,
+        "hidden_layers": [64, 64],
+        "kernel_size":   3,
+        "input_steps":   6,
+        "output_steps":  1
+      }
+    },
+
+    {
+      "stage": 4,
+      "name": "Training",
+      "file": "train.py",
+      "entry_point": "train(imd_path, mosdac_path)",
+      "hyperparameters": {
+        "epochs":        30,
+        "batch_size":    4,
+        "learning_rate": 0.001,
+        "hidden":        [64, 64],
+        "kernel_size":   3,
+        "teacher_ratio": 0.5,
+        "val_split":     0.15,
+        "grad_clip":     1.0,
+        "device":        "cuda if available else cpu"
+      },
+      "loss_function": {
+        "name": "WeatherLoss",
+        "formula": "alpha * MSE + (1 - alpha) * GradientLoss",
+        "alpha":  0.8,
+        "gradient_loss_purpose": "Penalises spatial over-smoothing — preserves sharp weather fronts"
+      },
+      "optimiser": "Adam",
+      "scheduler": "ReduceLROnPlateau (patience=5, factor=0.5)",
+      "checkpoint": {
+        "path": "checkpoints/best_model.pt",
+        "saves_on": "best validation loss",
+        "contents": ["epoch", "model_state_dict", "optimiser_state_dict", "vars_used", "val_loss"]
+      }
+    },
+
+    {
+      "stage": 5,
+      "name": "Inference & Output",
+      "file": "predict.py",
+      "entry_point": "predict(imd_path, mosdac_path, forecast_steps=6)",
+      "steps": [
+        "Load latest data window (last INPUT_STEPS frames)",
+        "Load best checkpoint",
+        "Autoregressive inference for forecast_steps (default: 6 hours ahead)",
+        "Denormalise to physical units",
+        "Save as .zarr to ../data/forecast_output.zarr"
+      ],
+      "inference_loop": {
+        "type": "autoregressive",
+        "description": "Each prediction is fed back as next input. Window slides forward by 1 step.",
+        "steps": 6,
+        "output_shape": "[6, C, H, W]"
+      },
+      "zarr_output": {
+        "path": "../data/forecast_output.zarr",
+        "dimensions": ["time", "latitude", "longitude"],
+        "variables": ["rainfall", "lst", "wind_speed"],
+        "coordinate_types": {
+          "time":      "datetime64 — future forecast timestamps",
+          "latitude":  "float64 — degrees North",
+          "longitude": "float64 — degrees East"
+        }
+      }
+    }
+  ],
+
+  "repository_structure": {
+    "MugizhNokku-Data-Pipeline/": {
+      "ingest.py":     "Stage 1 — Data loading (IMD + MOSDAC + synthetic fallback)",
+      "preprocess.py": "Stage 2 — Regrid, fill, normalise, build tensors",
+      "model.py":      "Stage 3 — ConvLSTMCell, ConvLSTM, CycloneForecaster",
+      "train.py":      "Stage 4 — Training loop, WeatherLoss, checkpointing",
+      "predict.py":    "Stage 5 — Inference + .zarr output",
+      "checkpoints/":  "Saved model weights (best_model.pt)",
+      "../data/":      "SHARED FOLDER — forecast_output.zarr consumed by SRI"
+    }
+  },
+
+  "team_interface": {
+    "Maxus_produces": "../data/forecast_output.zarr",
+    "SRI_consumes":   "../data/forecast_output.zarr",
+    "PHK_consumes":   "SRI-processed output (not Maxus directly)",
+    "zarr_schema_frozen": true,
+    "breaking_change_protocol": "Notify SRI before changing variable names or dimension order"
+  },
+
+  "run_order": [
+    "python train.py       # trains model, saves checkpoint",
+    "python predict.py     # runs inference, writes zarr"
+  ],
+
+  "dev_quickstart": {
+    "no_real_data_needed": true,
+    "synthetic_mode": "Activated automatically when imd_path/mosdac_path are None",
+    "first_run": [
+      "pip install torch xarray zarr h5py numpy rioxarray",
+      "python train.py",
+      "python predict.py",
+      "ls ../data/forecast_output.zarr"
+    ]
+  }
+}
